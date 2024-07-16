@@ -89,6 +89,9 @@ public:
 
   virtual ~StandardAggregateHashTable() {}
 
+  // select sum(s1),max(s2) from xxx group by s3,s4;
+  //groups chunk {s3,s4}
+  //aggrs chunk{s1,s2}
   RC add_chunk(Chunk &groups_chunk, Chunk &aggrs_chunk) override;
 
   StandardHashTable::iterator begin() { return aggr_values_.begin(); }

@@ -14,8 +14,36 @@ See the Mulan PSL v2 for more details. */
 
 RC StandardAggregateHashTable::add_chunk(Chunk &groups_chunk, Chunk &aggrs_chunk)
 {
-  // your code here
-  exit(-1);
+  if(groups_chunk.rows() != aggrs_chunk.rows()){
+    return RC::INVALID_ARGUMENT;
+  }
+
+  for(int i=0;i<groups_chunk.rows();i++){
+
+    vector<Value> column_value(groups_chunk.column_num());
+    for(int j=0;j<groups_chunk.column_num();j++){
+      column_value[j] = groups_chunk.column(j).get_value(i);
+    }
+
+    if(aggr_values_.contains(column_value)){
+      vector<Value> aggr_values = aggr_values_[column_value];
+      for(int j=0;j<aggr_values.size();j++){
+        if(aggr_values[j].attr_type() == AttrType::FLOATS){
+          aggr_values[j] = Value(aggr_values[j].get_float() + aggrs_chunk.column(j).get_value(i).get_float());
+        }else if(aggr_values[j].attr_type() == AttrType::INTS){
+          aggr_values[j] = Value(aggr_values[j].get_int() + aggrs_chunk.column(j).get_value(i).get_int());
+        }
+      }
+    } else{
+      vector<Value> aggr_values(aggrs_chunk.column_num());
+      for(int j=0;j<aggrs_chunk.column_num();j++){
+        aggr_values[j] = aggrs_chunk.column(j).get_value(i);
+      }
+      aggr_values_[column_value] = aggr_values;
+    }
+  }
+
+  return RC::SUCCESS;
 }
 
 void StandardAggregateHashTable::Scanner::open_scan()
