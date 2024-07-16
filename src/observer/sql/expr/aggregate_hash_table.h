@@ -8,167 +8,67 @@ EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
 MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
 See the Mulan PSL v2 for more details. */
 
-#include <vector>
-#include <iostream>
-#include <unordered_map>
+#pragma once
 
-#include "common/math/simd_util.h"
-#include "common/rc.h"
-#include "sql/expr/expression.h"
+#include "sql/operator/physical_operator.h"
 
 /**
- * @brief 用于hash group by 的哈希表实现，不支持并发访问。
+ * @brief 聚合物理算子 (Vectorized)
+ * @ingroup PhysicalOperator
  */
-class AggregateHashTable
+class AggregateVecPhysicalOperator : public PhysicalOperator
 {
 public:
-  class Scanner
-  {
-  public:
-    explicit Scanner(AggregateHashTable *hash_table) : hash_table_(hash_table) {}
-    virtual ~Scanner() = default;
+  AggregateVecPhysicalOperator(std::vector<Expression *> &&expressions);
 
-    virtual void open_scan() = 0;
+  virtual ~AggregateVecPhysicalOperator() = default;
 
-    /**
-     * 通过扫描哈希表，将哈希表中的聚合结果写入 chunk 中。
-     */
-    virtual RC next(Chunk &chunk) = 0;
+  PhysicalOperatorType type() const override { return PhysicalOperatorType::AGGREGATE_VEC; }
 
-    virtual void close_scan(){};
+  RC open(Trx *trx) override;
+  RC next(Chunk &chunk) override;
+  RC close() override;
 
-  protected:
-    AggregateHashTable *hash_table_;
-  };
-
-  /**
-   * @brief 将 groups_chunk 和 aggrs_chunk 写入到哈希表中。哈希表中记录了聚合结果。
-   */
-  virtual RC add_chunk(Chunk &groups_chunk, Chunk &aggrs_chunk) = 0;
-
-  virtual ~AggregateHashTable() = default;
-};
-
-class StandardAggregateHashTable : public AggregateHashTable
-{
 private:
-  struct VectorHash
+  template <class STATE, typename T>
+  void update_aggregate_state(void *state, const Column &column);
+
+  template <class STATE, typename T>
+  void append_to_column(void *state, Column &column)
   {
-    std::size_t operator()(const std::vector<Value> &vec) const;
-  };
-
-  struct VectorEqual
-  {
-    bool operator()(const std::vector<Value> &lhs, const std::vector<Value> &rhs) const;
-  };
-
-public:
-  using StandardHashTable = std::unordered_map<std::vector<Value>, std::vector<Value>, VectorHash, VectorEqual>;
-  class Scanner : public AggregateHashTable::Scanner
-  {
-  public:
-    explicit Scanner(AggregateHashTable *hash_table) : AggregateHashTable::Scanner(hash_table) {}
-    ~Scanner() = default;
-
-    void open_scan() override;
-
-    RC next(Chunk &chunk) override;
-
-  private:
-    StandardHashTable::iterator end_;
-    StandardHashTable::iterator it_;
-  };
-  StandardAggregateHashTable(const std::vector<Expression *> aggregations)
-  {
-    for (auto &expr : aggregations) {
-      ASSERT(expr->type() == ExprType::AGGREGATION, "expect aggregate expression");
-      auto *aggregation_expr = static_cast<AggregateExpr *>(expr);
-      aggr_types_.push_back(aggregation_expr->aggregate_type());
-    }
+    STATE *state_ptr = reinterpret_cast<STATE *>(state);
+    column.append_one((char *)&state_ptr->value);
   }
 
-  virtual ~StandardAggregateHashTable() {}
-
-  // select sum(s1),max(s2) from xxx group by s3,s4;
-  //groups chunk {s3,s4}
-  //aggrs chunk{s1,s2}
-  RC add_chunk(Chunk &groups_chunk, Chunk &aggrs_chunk) override;
-
-  StandardHashTable::iterator begin() { return aggr_values_.begin(); }
-  StandardHashTable::iterator end() { return aggr_values_.end(); }
-
 private:
-  /// group by values -> aggregate values
-  StandardHashTable                aggr_values_;
-  std::vector<AggregateExpr::Type> aggr_types_;
-};
-
-/**
- * @brief 线性探测哈希表实现
- * @note 当前只支持group by 列为 char/char(4) 类型，且聚合列为单列。
- */
-#ifdef USE_SIMD
-template <typename V>
-class LinearProbingAggregateHashTable : public AggregateHashTable
-{
-public:
-  class Scanner : public AggregateHashTable::Scanner
+  class AggregateValues
   {
   public:
-    explicit Scanner(AggregateHashTable *hash_table) : AggregateHashTable::Scanner(hash_table) {}
-    ~Scanner() = default;
+    AggregateValues() = default;
 
-    void open_scan() override;
+    void insert(void *aggr_value) { data_.push_back(aggr_value); }
 
-    RC next(Chunk &chunk) override;
+    void *at(size_t index)
+    {
+      ASSERT(index <= data_.size(), "index out of range");
+      return data_[index];
+    }
 
-    void close_scan() override;
+    size_t size() { return data_.size(); }
+    ~AggregateValues()
+    {
+      for (auto &aggr_value : data_) {
+        free(aggr_value);
+        aggr_value = nullptr;
+      }
+    }
 
   private:
-    int capacity_   = -1;
-    int size_       = -1;
-    int scan_pos_   = -1;
-    int scan_count_ = 0;
+    std::vector<void *> data_;
   };
-
-  LinearProbingAggregateHashTable(AggregateExpr::Type aggregate_type, int capacity = DEFAULT_CAPACITY)
-      : keys_(capacity, EMPTY_KEY), values_(capacity, 0), capacity_(capacity), aggregate_type_(aggregate_type)
-  {}
-  virtual ~LinearProbingAggregateHashTable() {}
-
-  RC get(int key, V &value);
-
-  RC iter_get(int pos, int &key, V &value);
-
-  RC add_chunk(Chunk &group_chunk, Chunk &aggr_chunk) override;
-
-  int capacity() { return capacity_; }
-  int size() { return size_; }
-
-private:
-  /**
-   * @brief 将键值对以批量的形式写入哈希表中，这里参考了论文
-   * `Rethinking SIMD Vectorization for In-Memory Databases` 中的 `Algorithm 5`。
-   * @param input_keys 输入的键数组
-   * @param input_values 输入的值数组，与键数组一一对应。
-   * @param len 键值对数组的长度
-   */
-  void add_batch(int *input_keys, V *input_values, int len);
-
-  void aggregate(V *value, V value_to_aggregate);
-
-  void resize();
-
-  void resize_if_need();
-
-private:
-  static const int EMPTY_KEY;
-  static const int DEFAULT_CAPACITY;
-
-  std::vector<int>    keys_;
-  std::vector<V>      values_;
-  int                 size_     = 0;
-  int                 capacity_ = 0;
-  AggregateExpr::Type aggregate_type_;
+  std::vector<Expression *> aggregate_expressions_;  /// 聚合表达式
+  std::vector<Expression *> value_expressions_;
+  Chunk                     chunk_;
+  Chunk                     output_chunk_;
+  AggregateValues           aggr_values_;
 };
-#endif
