@@ -8,68 +8,50 @@ EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
 MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
 See the Mulan PSL v2 for more details. */
 
+//
+// Created by WangYunlai on 2024/05/29.
+//
+
 #pragma once
 
 #include "sql/operator/physical_operator.h"
+#include "sql/expr/composite_tuple.h"
 
 /**
- * @brief 聚合物理算子 (Vectorized)
+ * @brief Group By 物理算子基类
  * @ingroup PhysicalOperator
  */
-class AggregateVecPhysicalOperator : public PhysicalOperator
+class GroupByPhysicalOperator : public PhysicalOperator
 {
 public:
-  AggregateVecPhysicalOperator(std::vector<Expression *> &&expressions);
+  GroupByPhysicalOperator(std::vector<Expression *> &&expressions);
+  virtual ~GroupByPhysicalOperator() = default;
 
-  virtual ~AggregateVecPhysicalOperator() = default;
+protected:
+  using AggregatorList = std::vector<std::unique_ptr<Aggregator>>;
+  /**
+   * @brief 聚合出来的一组数据
+   * @details
+   * 第一个参数是聚合函数列表，比如需要计算 sum(a), avg(b), count(c)。
+   * 第二个参数是聚合的最终结果，它也包含两个元素，第一个是缓存下来的元组，第二个是聚合函数计算的结果。
+   * 第二个参数中，之所以要缓存下来一个元组，是要解决这个问题：
+   * select a, b, sum(a) from t group by a;
+   * 我们需要知道b的值是什么，虽然它不确定。
+   */
+  using GroupValueType = std::tuple<AggregatorList, CompositeTuple>;
 
-  PhysicalOperatorType type() const override { return PhysicalOperatorType::AGGREGATE_VEC; }
+protected:
+  void create_aggregator_list(AggregatorList &aggregator_list);
 
-  RC open(Trx *trx) override;
-  RC next(Chunk &chunk) override;
-  RC close() override;
+  /// @brief 聚合一条记录
+  /// @param aggregator_list 需要执行聚合运算的列表
+  /// @param tuple 执行聚合运算的一条记录
+  RC aggregate(AggregatorList &aggregator_list, const Tuple &tuple);
 
-private:
-  template <class STATE, typename T>
-  void update_aggregate_state(void *state, const Column &column);
+  /// @brief 所有tuple聚合结束后，运算最终结果
+  RC evaluate(GroupValueType &group_value);
 
-  template <class STATE, typename T>
-  void append_to_column(void *state, Column &column)
-  {
-    STATE *state_ptr = reinterpret_cast<STATE *>(state);
-    column.append_one((char *)&state_ptr->value);
-  }
-
-private:
-  class AggregateValues
-  {
-  public:
-    AggregateValues() = default;
-
-    void insert(void *aggr_value) { data_.push_back(aggr_value); }
-
-    void *at(size_t index)
-    {
-      ASSERT(index <= data_.size(), "index out of range");
-      return data_[index];
-    }
-
-    size_t size() { return data_.size(); }
-    ~AggregateValues()
-    {
-      for (auto &aggr_value : data_) {
-        free(aggr_value);
-        aggr_value = nullptr;
-      }
-    }
-
-  private:
-    std::vector<void *> data_;
-  };
+protected:
   std::vector<Expression *> aggregate_expressions_;  /// 聚合表达式
-  std::vector<Expression *> value_expressions_;
-  Chunk                     chunk_;
-  Chunk                     output_chunk_;
-  AggregateValues           aggr_values_;
-  bool                      consumed_;
+  std::vector<Expression *> value_expressions_;      /// 计算聚合时的表达式
 };
